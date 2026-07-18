@@ -1,0 +1,25 @@
+# Python / Virtual Environment
+backend/.venv/
+backend/app/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+celerybeat-schedule
+*.db
+*.sqlite3
+
+# Node / Frontend / Mock Repos
+frontend/node_modules/
+frontend/dist/
+.eslintcache
+sample-repositories/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Docker / Environment variables
+.env
+.env.*
+!docker-compose.yml

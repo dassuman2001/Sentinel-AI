@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: sentinel-db
+    restart: always
+    environment:
+      MYSQL_DATABASE: sentinel_db
+      MYSQL_USER: sentinel_user
+      MYSQL_PASSWORD: sentinel_password
+      MYSQL_ROOT_PASSWORD: root_password
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "sentinel_user", "-psentinel_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.0-alpine
+    container_name: sentinel-redis
+    restart: always
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-backend
+    restart: always
+    environment:
+      - ENV=dev
+      - DATABASE_URL=mysql+pymysql://sentinel_user:sentinel_password@db:3306/sentinel_db
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=supersecretkeyforlocaldevchangeinprod123456
+      - ACCESS_TOKEN_EXPIRE_MINUTES=60
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-worker
+    command: celery -A app.tasks.worker.celery_app worker --loglevel=info
+    restart: always
+    environment:
+      - ENV=dev
+      - DATABASE_URL=mysql+pymysql://sentinel_user:sentinel_password@db:3306/sentinel_db
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=supersecretkeyforlocaldevchangeinprod123456
+      - ACCESS_TOKEN_EXPIRE_MINUTES=60
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-beat
+    command: celery -A app.tasks.worker.celery_app beat --loglevel=info
+    restart: always
+    environment:
+      - ENV=dev
+      - DATABASE_URL=mysql+pymysql://sentinel_user:sentinel_password@db:3306/sentinel_db
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=supersecretkeyforlocaldevchangeinprod123456
+      - ACCESS_TOKEN_EXPIRE_MINUTES=60
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  redis_data:
