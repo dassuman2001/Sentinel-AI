@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  db_migration:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -c "from app.database.session import engine; from app.database.base_class import Base; Base.metadata.create_all(bind=engine)"
+    depends_on:
+      - redis
+    env_file:
+      - ./backend/.env
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    restart: always
+    depends_on:
+      - redis
+    env_file:
+      - ./backend/.env
+
+  redis:
+    image: redis:7.0-alpine
+    restart: always
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.tasks.worker.celery_app worker --loglevel=info
+    restart: always
+    depends_on:
+      - redis
+    env_file:
+      - ./backend/.env

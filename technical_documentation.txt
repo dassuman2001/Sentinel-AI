@@ -1,0 +1,221 @@
+SENTINEL AI - TECHNICAL DEVELOPMENT DOCUMENTATION
+=================================================
+
+This document provides a comprehensive technical overview of the Sentinel AI codebase for development teammates. It covers architectural design, directory structures, code components, core APIs, background scanning engines, and execution instructions.
+
+---
+
+1. ARCHITECTURAL OVERVIEW & DECOUPLED USER SCOPE
+===============================================
+Initially, the platform used a multi-tenant hierarchy consisting of:
+  Organizations -> Projects -> Repositories -> Scans -> Secrets
+  
+To simplify the user onboarding workflow and reduce operational friction, the "Organization" and "Project" schemas have been completely decoupled from the asset boundary. 
+
+Key Architectural Shifts:
+* The `Repository` model now acts as the root boundary for assets and links directly to a `User` via the `user_id` foreign key.
+* All data flows directly from the user: User -> Repository -> Scans -> Secrets -> AIAnalysis.
+* All API endpoints, query filters, and UI display components have been updated to check repository ownership directly (`Repository.user_id == current_user.id`).
+* An automated schema sync is configured: during startup, the application verifies the schema and recreates tables automatically.
+
+---
+
+2. FILE SYSTEM & CODE STRUCTURE
+===============================
+The workspace is organized into a decoupled frontend React application and a Python FastAPI backend:
+
+/ (Root)
+├── Makefile                      # Standard local workflow command aliases
+├── docker-compose.yml            # Multi-container dev orchestration configuration
+├── technical_documentation.txt   # This document
+├── .gitignore                    # Excludes build, virtualenv, and local credentials
+├── .env.example                  # Environment configuration template
+│
+├── backend/                      # Python FastAPI application
+│   ├── Dockerfile                # Backend container instruction file
+│   ├── requirements.txt          # Python application dependencies
+│   ├── .env                      # Local un-tracked environment variables
+│   │
+│   ├── app/                      # Main application module
+│   │   ├── main.py               # Application entry point & startup schema generation
+│   │   ├── database/             # SQLAlchemy connection & session providers
+│   │   ├── models/               # SQLAlchemy ORM models (User, Repository, Scan, etc.)
+│   │   ├── schemas/              # Pydantic schemas for request validation & output serialization
+│   │   ├── api/v1/               # Version 1 Router & Endpoints
+│   │   ├── scanner/              # Core regex/entropy scanning engine
+│   │   ├── tasks/                # Celery background tasks & beat schedules
+│   │   └── security/             # Password hashing, JWT token verification & OAuth
+│   │
+│   └── tests/                    # Pytest suite using SQLite in-memory database
+│
+└── frontend/                     # React + Vite application
+    ├── src/
+    │   ├── App.tsx               # Main application container containing all UI & API hooks
+    │   ├── index.css             # Design system styling tokens & Tailwind utilities
+    │   └── main.tsx              # React mounting root
+    ├── package.json              # NPM dependencies & scripts
+    └── vite.config.ts            # Vite compiler & API proxy configuration
+
+---
+
+3. BACKEND CORE CODE & DATABASE MODELS
+======================================
+The backend uses SQLAlchemy ORM models mapped to the MySQL database tables.
+
+* User (app/models/user.py)
+  Represents authenticated users. Has a direct relationship to `repositories` allowing cascading deletions. Includes `email`, `hashed_password`, `role` ("admin" or "developer"), `first_name`, and `last_name`.
+  
+* Repository (app/models/repository.py)
+  Contains target configuration.
+  Attributes:
+    - `user_id`: ForeignKey linking directly to the owner User.
+    - `name`: Display name.
+    - `clone_url`: HTTPS Git clone URL or absolute local folder path.
+    - `provider`: "github", "gitlab", "bitbucket", "azure", or "local".
+    - `scan_schedule`: "manual", "daily", "weekly".
+    - `access_token`: Optional credentials for cloning private repositories.
+    
+* Scan (app/models/scan.py)
+  Represents a scanner execution.
+  Attributes:
+    - `repository_id`: Associated repository.
+    - `status`: "pending", "running", "completed", "failed".
+    - `secrets_found`: Number of secrets discovered during this run.
+    - `commit_hash`: Git commit metadata.
+    
+* Secret (app/models/secret.py)
+  Vulnerabilities discovered by the engine.
+  Attributes:
+    - `scan_id`: Associated scan ID.
+    - `file_path`, `line_number`, `secret_type`, `entropy`.
+    - `detected_value_hashed`: SHA-256 hash of the secret to prevent double-logging.
+    - `masked_value`: Safe display version of the secret.
+    - `status`: "active", "resolved", "false_positive".
+    - `severity`: "low", "medium", "high", "critical".
+
+* AIAnalysis (app/models/ai_analysis.py)
+  Stores explanations and chat threads for discovered secrets, cached to minimize LLM API token usage.
+
+---
+
+4. API ENDPOINTS EXPLANATION (backend/app/api/v1/endpoints/)
+=============================================================
+
+* auth.py
+  Handles user signup, password login, and OAuth integrations.
+  - `POST /register`: Registers a new user. The first user dynamically becomes an "admin".
+  - `POST /login`: Validates password and issues access and refresh tokens.
+  - `POST /google-login`: Validates Google JWT tokens and performs user signup/signin.
+
+* repositories.py
+  - `POST /`: Registers a new repository. Automatically scopes ownership to the current logged-in user.
+  - `GET /`: Lists all repositories belonging to the current user.
+  - `DELETE /{repo_id}`: Deletes a repository and all related scans, secrets, and AI cache.
+  - `GET /{repo_id}/branches/remote`: Uses git commands to fetch remote branches dynamically.
+  - `POST /{repo_id}/scan`: Triggers a Celery background scan task.
+
+* scans.py
+  - `GET /`: Lists scan history. If `repository_id` query parameter is omitted, returns history across all user repositories.
+  - `GET /{scan_id}`: Retrieves details for a specific scan.
+
+* secrets.py
+  - `GET /`: Lists secrets discovered across repositories.
+  - `PATCH /{secret_id}/status`: Updates status ("resolved", "false_positive") and logs an audit trail.
+
+* dashboard.py
+  - `GET /stats`: Returns overall stats (active leaks, averages, risk score).
+  - `GET /charts/secrets-by-severity`: Grouped leak counts by severity.
+  - `GET /charts/secrets-by-type`: Grouped leak counts by secret type.
+
+* ai.py
+  - `GET /explain/{secret_id}`: Returns LLM-generated explanation of the leak, risk, and rotation instructions.
+  - `POST /chat/{secret_id}`: Interactive chat assistant scoped to the context of the selected leak.
+
+* audit.py
+  - `GET /`: Lists audit logs scoped to the authenticated user.
+
+---
+
+5. CORE SCANNING ENGINE (backend/app/scanner/engine.py)
+======================================================
+The `SecretScanner` runs pattern matching and mathematical analysis on directories:
+
+* Regex Pattern Matching:
+  A dictionary of pre-compiled rules identifies common secret structures:
+  - AWS Access Keys: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|APKA|ASCA|ASIA)[A-Z0-9]{16}`
+  - Generic Private Keys: `-----BEGIN [A-Z ]+ PRIVATE KEY-----`
+  - Slack Webhooks: `https://hooks.slack.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}`
+  - Stripe API Keys: `sk_live_[0-9a-zA-Z]{24}`
+  - Database Connection Strings: `[a-zA-Z0-9]+://[^:]+:[^@]+@[^/]+/.*`
+
+* Entropy Checks (Shannon Entropy):
+  Calculates the randomness of a string to identify random-looking strings (like passwords or API tokens):
+  `H = -Sum(p_i * log2(p_i))`
+  Strings exceeding an entropy score of 3.8 that are assigned to variables (e.g. `apiKey = "..."`) are flagged as "High Entropy Credentials".
+
+---
+
+6. CELERY BACKGROUND WORKER & TASKS (backend/app/tasks/)
+========================================================
+Background scanning is offloaded asynchronously to Celery:
+
+* scan_tasks.py:
+  - `run_repository_scan(repo_id, branch_name)`: Clones the git repository to a temporary workspace using the repository's `access_token` if required. Then runs the `SecretScanner` on it, hashes detected secrets to deduplicate findings, writes them to the DB, and deletes the temporary workspace.
+  - `check_scheduled_scans()`: Periodic cron task (configured via Celery Beat) that scans repositories with `"daily"` schedules every 24 hours and `"weekly"` schedules every 7 days.
+
+---
+
+7. FRONTEND REACT APP (`App.tsx`)
+=================================
+The frontend is a single-page React app with Tailwind CSS styling:
+
+* State Management:
+  Manages tab views (`dashboard`, `repos`, `scans`, `secrets`, `audit`), authenticated state (JWT token and user profile), forms, and selected items.
+* Real-Time Polling:
+  When a scan is triggered, the frontend polls `/api/v1/scans/{id}` every 3 seconds until status is "completed" or "failed", then triggers a silent refresh of the dashboard data.
+* Provider-Neutral Input Fields:
+  When registering a repository, `getPlaceholderByProvider()` returns a clean, dynamic placeholder matching the chosen provider to avoid bias:
+  - GitHub: `https://github.com/user/repo.git`
+  - Local Folder: `/path/to/local/repo`
+  - GitLab: `https://gitlab.com/user/repo.git`
+
+---
+
+8. DEVELOPMENT COMMANDS & RUNNING INSTRUCTIONS
+==============================================
+Ensure Docker Desktop is running before starting the services.
+
+1. Reset Database & Build Containers:
+   ```bash
+   docker compose down -v
+   docker compose up --build -d
+   ```
+   * The database tables will be automatically created on backend container start.
+
+2. Run Pytest Suite:
+   ```bash
+   cd backend
+   PYTHONPATH=. .venv/bin/pytest tests/
+   ```
+
+3. Run Dev Mode Locally (Live Reload):
+   * Backend:
+     ```bash
+     cd backend
+     .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
+     ```
+   * Frontend:
+     ```bash
+     cd frontend
+     npm run dev
+     ```
+   * Celery Worker:
+     ```bash
+     cd backend
+     PYTHONPATH=. .venv/bin/celery -A app.tasks.worker.celery_app worker --loglevel=info
+     ```
+   * Celery Beat:
+     ```bash
+     cd backend
+     PYTHONPATH=. .venv/bin/celery -A app.tasks.worker.celery_app beat --loglevel=info
+     ```

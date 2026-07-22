@@ -19,6 +19,14 @@ sample-repositories/
 .DS_Store
 Thumbs.db
 
+# Terraform local folders & state
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/*.tfvars
+terraform/terraform.tfvars
+terraform/sentinel_key*
+terraform/bin/
+
 # Docker / Environment variables
 .env
 .env.*
