@@ -31,3 +31,6 @@ terraform/bin/
 .env
 .env.*
 !docker-compose.yml
+
+
+technical_documentation.txt
